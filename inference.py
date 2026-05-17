@@ -13,10 +13,11 @@ from dataset import PixelSetData
 
 
 def prepare_model_and_loader(config):
-    mean_std = pkl.load(open(config['dataset_folder'] + '/S2-2017-T31TFM-meanstd.pkl', 'rb'))
+    mean_std = pkl.load(open(config['dataset_folder'] + '/2024-Slovakia-meanstd.pkl', 'rb'))
     extra = 'geomfeat' if config['geomfeat'] else None
-    dt = PixelSetData(config['dataset_folder'], labels='label_44class', npixel=config['npixel'],
-                      sub_classes=[1, 3, 4, 5, 6, 8, 9, 12, 13, 14, 16, 18, 19, 23, 28, 31, 33, 34, 36, 39],
+    dt = PixelSetData(config['dataset_folder'], labels='CODE_GROUP', npixel=config['npixel'], #CODE_GROUP label_44class
+                    #   sub_classes=[1, 3, 4, 5, 6, 8, 9, 12, 13, 14, 16, 18, 19, 23, 28, 31, 33, 34, 36, 39],
+                     sub_classes=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
                       norm=mean_std,
                       extra_feature=extra, return_id=True)
     dl = data.DataLoader(dt, batch_size=config['batch_size'], num_workers=config['num_workers'])
@@ -100,8 +101,8 @@ if __name__ == '__main__':
     parser.add_argument('--input_dim', default=10, type=int, help='Number of channels of input images')
     parser.add_argument('--mlp1', default='[10,32,64]', type=str, help='Number of neurons in the layers of MLP1')
     parser.add_argument('--pooling', default='mean_std', type=str, help='Pixel-embeddings pooling strategy')
-    parser.add_argument('--mlp2', default='[132,128]', type=str, help='Number of neurons in the layers of MLP2')
-    parser.add_argument('--geomfeat', default=1, type=int,
+    parser.add_argument('--mlp2', default='[128,128]', type=str, help='Number of neurons in the layers of MLP2')
+    parser.add_argument('--geomfeat', default=0, type=int,
                         help='If 1 the precomputed geometrical features (f) are used in the PSE.')
 
     ## TAE

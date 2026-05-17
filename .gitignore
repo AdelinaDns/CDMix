@@ -104,3 +104,10 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+# Training outputs
+logs/
+results/
+wandb/
+
+# Scripts
+train.sh
