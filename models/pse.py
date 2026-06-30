@@ -77,7 +77,7 @@ class PixelSetEncoder(nn.Module):
         shape Batch_size x Sequence length x Embedding dimension
         """
         a, b = input
-        if len(a) == 2:
+        if isinstance(a, (list, tuple)):
             out, mask = a
             extra = b
             if len(extra) == 2:
@@ -86,18 +86,19 @@ class PixelSetEncoder(nn.Module):
             out, mask = a, b
 
         if len(out.shape) == 4:
-            # Combine batch and temporal dimensions in case of sequential input
             reshape_needed = True
             batch, temp = out.shape[:2]
-
             out = out.view(batch * temp, *out.shape[2:])
             mask = mask.view(batch * temp, -1)
-            if self.with_extra:
-                extra = extra.view(batch * temp, -1)
+        elif len(mask.shape) == 3:          # <-- adaugă asta
+            reshape_needed = False
+            mask = mask.view(-1, mask.shape[-1])   # aplatizează (B, T, npixel) → (B*T, npixel)
         else:
             reshape_needed = False
 
         out = self.mlp1(out)
+        # print(f"[PSE] after mlp1: out={out.shape}, mask={mask.shape}")
+
         out = torch.cat([pooling_methods[n](out, mask) for n in self.pooling.split('_')], dim=1)
 
         if self.with_extra:
@@ -128,26 +129,27 @@ class linlayer(nn.Module):
         return out
 
 def masked_mean(x, mask):
+    # print(f"[MEAN] x={x.shape}, mask={mask.shape}")
     out = x.permute((1, 0, 2))
     out = out * mask
     out = out.sum(dim=-1) / mask.sum(dim=-1)
     out = out.permute((1, 0))
+    # print(f"[MEAN] out={out.shape}")
     return out
 
 def masked_std(x, mask):
+    # print(f"[STD] x={x.shape}, mask={mask.shape}")
     m = masked_mean(x, mask)
-
     out = x.permute((2, 0, 1))
     out = out - m
     out = out.permute((2, 1, 0))
-
     out = out * mask
     d = mask.sum(dim=-1)
     d[d == 1] = 2
-
     out = (out ** 2).sum(dim=-1) / (d - 1)
-    out = torch.sqrt(out + 10e-32) # To ensure differentiability
+    out = torch.sqrt(out + 10e-32)
     out = out.permute(1, 0)
+    # print(f"[STD] out={out.shape}")
     return out
 
 def maximum(x, mask):

@@ -40,10 +40,22 @@ class PixelSetData(data.Dataset):
         self.return_id = return_id
 
         l = [f for f in os.listdir(self.data_folder) if f.endswith('.npy')]
-        self.pid = [int(f.split('.')[0]) for f in l]
-        self.pid = list(np.sort(self.pid))
 
-        self.pid = list(map(str, self.pid))
+        def natural_key(s):
+            parts = s.replace(".npy", "").split("_")
+            key = []
+            for part in parts:
+                if part.isdigit():
+                    key.append(int(part))
+                else:
+                    key.append(part)
+            return key
+
+        self.pid = sorted(
+            [os.path.splitext(f)[0] for f in l],
+            key=natural_key
+        )
+
         self.len = len(self.pid)
 
         # Get Labels

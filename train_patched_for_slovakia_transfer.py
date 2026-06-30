@@ -993,7 +993,7 @@ if __name__ == '__main__':
     # Resume / fine-tune
     # -----------------------------------------------------------------------
     parser.add_argument('--mixup_type', default='temporal', type=str,
-                    choices=['linear', 'temporal', 'bands', 'pixels'],
+                    choices=['linear', 'temporal', 'bands', 'pixels', 'none'],
                     help='Tipul de mixup. Dacă nu e setat, nu se face mixup.')
     parser.add_argument('--mixup_warmup_epochs', default=50, type=int,  
                         help='Numărul de epoci în care lam scade de la 1.0 (pur PASTIS) '
@@ -1130,6 +1130,10 @@ if __name__ == '__main__':
     # -----------------------------------------------------------------------
     config = parser.parse_args()
     config = vars(config)
+
+    # PATCHED_BY_run_slovakia_transfer_experiments__mixup_none_support
+    if config.get('mixup_type') == 'none':
+        config['mixup_type'] = None
 
     for k in list(config.keys()):
         if k.startswith('mlp'):

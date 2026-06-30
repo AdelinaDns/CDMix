@@ -55,14 +55,14 @@ except ImportError:
 #  CONFIGURATION  ← edit this block only
 # ══════════════════════════════════════════════════════════════════════════════
 
-YEAR             = 2022
+YEAR             = 2025
 GEE_PROJECT      = "disertatie-496115"
 GCS_BUCKET       = "disertatie-496115-lpis"
-GCS_PREFIX       = "2022_slovakia"
-OUTPUT_PATH      = "./PixelSet-Slovakia-2022"
-LPIS_ASSET       = "projects/disertatie-496115/assets/2022_Slovakia"
+GCS_PREFIX       = "2025_slovakia"
+OUTPUT_PATH      = "./PixelSet-Slovakia-2025"
+LPIS_ASSET       = "projects/disertatie-496115/assets/2025_Slovakia"
 PARCEL_ID_PROP   = "ID_UNIC"
-LABEL_NAMES      = ["CODE_GROUP"]
+LABEL_NAMES      = ["label"]
 
 BATCH_SIZE       = 500    # polygons per GEE export task
 TILE_SCALE       = 8      # increase to 16 if GEE raises memory errors
