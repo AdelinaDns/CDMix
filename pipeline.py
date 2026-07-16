@@ -64,19 +64,17 @@ LPIS_ASSET       = "projects/disertatie-496115/assets/2025_Slovakia"
 PARCEL_ID_PROP   = "ID_UNIC"
 LABEL_NAMES      = ["label"]
 
-BATCH_SIZE       = 500    # polygons per GEE export task
-TILE_SCALE       = 8      # increase to 16 if GEE raises memory errors
-CS_THRESHOLD     = 0.60   # Cloud Score+ cs_cdf threshold
-MAX_CONCURRENT   = 20     # simultaneous GEE export tasks
-POLL_INTERVAL    = 30     # seconds between task status polls
+BATCH_SIZE       = 500    
+TILE_SCALE       = 8      
+CS_THRESHOLD     = 0.60   
+MAX_CONCURRENT   = 20     
+POLL_INTERVAL    = 30     
 N_CSV_WORKERS    = min(os.cpu_count(), 16)
 N_INTERP_WORKERS = min(os.cpu_count(), 16)
 
 # Dataset filtering & sampling
-MAX_PIXELS       = 500    # parcels with S > MAX_PIXELS are randomly subsampled
-                           # keeps large parcels but limits GPU memory per batch
-                           # set to None to disable subsampling
-MIN_PIXELS       = 3      # parcels with fewer pixels are excluded
+MAX_PIXELS       = 500    
+MIN_PIXELS       = 3      
 
 S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
 

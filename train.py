@@ -1,9 +1,10 @@
 import torch
+import torch.nn as nn
 import torch.utils.data as data
 import torchnet as tnt
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score
 import os
 import json
 import pickle as pkl
@@ -27,15 +28,7 @@ from learning.metrics import mIou, confusion_matrix_analysis
 # ---------------------------------------------------------------------------
 
 def mixup_2_dataset(x_pastis, y_pastis, x_slovakia, y_slovakia, lam, device):
-    """
-    Mixup între PASTIS și Slovakia la nivel de input tensori.
-    lam=1   → pur PASTIS
-    lam=0   → pur Slovakia
-    Schedule: lam scade de la 1→0 pe parcursul epocilor (începem cu PASTIS, adăugăm Slovakia).
 
-    x are structura: [(pixel_set, mask)] sau [pixel_set, mask]
-    — recursive_todevice a transformat deja totul în tensori pe device.
-    """
     def mix_tensors(a, b):
         if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
             # aliniază dimensiunea batch dacă e nevoie (ultimul batch poate diferi)
@@ -48,7 +41,6 @@ def mixup_2_dataset(x_pastis, y_pastis, x_slovakia, y_slovakia, lam, device):
 
     x_mixed = mix_tensors(x_pastis, x_slovakia)
 
-    # taie și labelurile la min_batch
     min_b = min(y_pastis.shape[0], y_slovakia.shape[0])
     y_a = y_pastis[:min_b]
     y_b = y_slovakia[:min_b]
@@ -61,19 +53,12 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 
 
 def compute_lam(epoch, total_epochs, warmup_epochs=20):
-    """
-    lam=1 (pur PASTIS) la epoch=1
-    lam=0 (pur Slovakia) la epoch=warmup_epochs
-    lam=0 constant după warmup_epochs
-    """
+
     if epoch >= warmup_epochs:
         return 0.0
     return 1.0 - (epoch - 1) / (warmup_epochs - 1)
 def cutmix_temporal(x_pastis, x_slovakia, lam):
-    """
-    Primele T1 = round(lam * T) timesteps din PASTIS, restul din Slovakia.
-    x shape: (B, T, C, npixel) pentru pixel-set, (B, T, npixel) pentru mask.
-    """
+
     def cut_temporal(a, b):
         if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
             min_b = min(a.shape[0], b.shape[0])
@@ -94,10 +79,7 @@ def cutmix_temporal(x_pastis, x_slovakia, lam):
 
 
 def cutmix_bands(x_pastis, x_slovakia, lam):
-    """
-    C1 = round(lam * C) benzi alese random din PASTIS, restul din Slovakia.
-    x shape pixel-set: (B, T, C, npixel)
-    """
+
     def cut_bands(a, b):
         if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
             min_b = min(a.shape[0], b.shape[0])
@@ -123,11 +105,6 @@ def cutmix_bands(x_pastis, x_slovakia, lam):
 
 
 def cutmix_pixels(x_pastis, x_slovakia, lam):
-    """
-    P1 = round(lam * npixel) pixeli aleși random din PASTIS, restul din Slovakia.
-    x shape pixel-set: (B, T, C, npixel)
-    mask shape: (B, T, npixel)
-    """
     def cut_pixels(a, b):
         if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
             min_b = min(a.shape[0], b.shape[0])
@@ -149,10 +126,7 @@ def cutmix_pixels(x_pastis, x_slovakia, lam):
 
 def train_epoch_mixup(model, optimizer, criterion, pastis_loader, slovakia_loader,
                       epoch, device, config):
-    """
-    Antrenare cu mixup între PASTIS și Slovakia.
-    Iterează după loader-ul mai mic (Slovakia), ciclează PASTIS.
-    """
+
     acc_meter = tnt.meter.ClassErrorMeter(accuracy=True)
     loss_meter = tnt.meter.AverageValueMeter()
     y_true, y_pred = [], []
@@ -233,29 +207,342 @@ def train_epoch_mixup(model, optimizer, criterion, pastis_loader, slovakia_loade
         'train_IoU':      mIou(y_true, y_pred, n_classes=config['num_classes']),
     }
 # ---------------------------------------------------------------------------
+# Feature-space alignment helpers (MMD & CORAL) — a 4-a familie
+# ---------------------------------------------------------------------------
+
+def forward_with_embedding(model, x):
+    feat   = model.spatial_encoder(x)
+    z      = model.temporal_encoder(feat)
+    logits = model.decoder(z)
+    return z, logits
+
+
+def gaussian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+    n_total = source.size(0) + target.size(0)
+    total   = torch.cat([source, target], dim=0)
+
+    total0 = total.unsqueeze(0).expand(n_total, n_total, total.size(1))
+    total1 = total.unsqueeze(1).expand(n_total, n_total, total.size(1))
+    l2 = ((total0 - total1) ** 2).sum(2)
+
+    if fix_sigma is not None:
+        bandwidth = fix_sigma
+    else:
+        bandwidth = l2.detach().sum() / (n_total ** 2 - n_total + 1e-8)
+
+    bandwidth  = bandwidth / (kernel_mul ** (kernel_num // 2))
+    bandwidths = [bandwidth * (kernel_mul ** i) for i in range(kernel_num)]
+    kernels    = [torch.exp(-l2 / (bw + 1e-8)) for bw in bandwidths]
+    return sum(kernels)
+
+
+def mmd_loss(z_s, z_t, kernel_mul=2.0, kernel_num=5, standardize=True):
+    n = min(z_s.size(0), z_t.size(0))
+    z_s, z_t = z_s[:n], z_t[:n]
+    if standardize:
+        tot = torch.cat([z_s, z_t], dim=0)
+        mu = tot.mean(dim=0, keepdim=True).detach()
+        sd = (tot.std(dim=0, keepdim=True) + 1e-8).detach()
+        z_s = (z_s - mu) / sd
+        z_t = (z_t - mu) / sd
+    kernels = gaussian_kernel(z_s, z_t, kernel_mul, kernel_num)
+    XX = kernels[:n, :n]
+    YY = kernels[n:, n:]
+    XY = kernels[:n, n:]
+    YX = kernels[n:, :n]
+    return torch.mean(XX + YY - XY - YX)
+
+
+def mmd_diagnostic(z_s, z_t, fractions=(0.1, 1.0, 10.0)):
+    with torch.no_grad():
+        n = min(z_s.size(0), z_t.size(0))
+        a, b = z_s[:n].detach(), z_t[:n].detach()
+        # aceeasi standardizare ca in mmd_loss, ca diagnoza sa masoare gapul real
+        tot = torch.cat([a, b], dim=0)
+        mu = tot.mean(dim=0, keepdim=True)
+        sd = tot.std(dim=0, keepdim=True) + 1e-8
+        a, b = (a - mu) / sd, (b - mu) / sd
+        total = torch.cat([a, b], dim=0)
+        m = total.size(0)
+        t0 = total.unsqueeze(0).expand(m, m, total.size(1))
+        t1 = total.unsqueeze(1).expand(m, m, total.size(1))
+        l2 = ((t0 - t1) ** 2).sum(2)
+        bw_median = (l2.sum() / (m ** 2 - m + 1e-8)).item()
+
+        out = {'mmd_bw_median': bw_median}
+        vals = []
+        for frac in fractions:
+            bw = bw_median * frac + 1e-8
+            k = torch.exp(-l2 / bw)
+            XX = k[:n, :n]; YY = k[n:, n:]; XY = k[:n, n:]; YX = k[n:, :n]
+            v = torch.mean(XX + YY - XY - YX).item()
+            tag = ('%g' % frac).replace('.', 'p')
+            out[f'mmd_at_{tag}x'] = v
+            vals.append(v)
+        out['mmd_max'] = max(vals)
+        return out
+
+
+def coral_loss(z_s, z_t):
+    d = z_s.size(1)
+
+    def cov(z):
+        n  = z.size(0)
+        zc = z - z.mean(dim=0, keepdim=True)
+        return (zc.t() @ zc) / (n - 1 + 1e-8)
+
+    c_s = cov(z_s)
+    c_t = cov(z_t)
+    return ((c_s - c_t) ** 2).sum() / (4.0 * d * d)
+
+class CentroidMemory:
+    """Prototipuri EMA per clasa/domeniu + asignare stabila pe epoca."""
+
+    def __init__(self, ema=0.9, std_ema=0.99):
+        self.ema = ema
+        self.std_ema = std_ema
+        self.proto_s, self.proto_t = {}, {}    
+        self.count_s, self.count_t = {}, {}     
+        self.zstd = None                        
+        self.assignment_map = {}                
+
+    @staticmethod
+    def _batch_means_counts(z, y):
+        means, counts = {}, {}
+        for k in torch.unique(y).tolist():
+            zk = z[y == k]
+            means[int(k)] = zk.mean(dim=0)      # cu gradient
+            counts[int(k)] = zk.size(0)
+        return means, counts
+
+    def observe(self, z_s, y_s, z_t, y_t):
+        s = torch.cat([z_s, z_t], dim=0).detach().std(dim=0)
+        self.zstd = s.clone() if self.zstd is None else self.std_ema * self.zstd + (1 - self.std_ema) * s
+
+        ms, cs = self._batch_means_counts(z_s, y_s)
+        mt, ct = self._batch_means_counts(z_t, y_t)
+        for k, v in ms.items():
+            vd = v.detach()
+            self.proto_s[k] = vd.clone() if k not in self.proto_s else self.ema * self.proto_s[k] + (1 - self.ema) * vd
+            self.count_s[k] = self.count_s.get(k, 0) + cs[k]
+        for k, v in mt.items():
+            vd = v.detach()
+            self.proto_t[k] = vd.clone() if k not in self.proto_t else self.ema * self.proto_t[k] + (1 - self.ema) * vd
+            self.count_t[k] = self.count_t.get(k, 0) + ct[k]
+        return ms, mt
+
+    def compute_assignment(self, min_count=50, mutual_nn=True):
+        std = self.zstd if self.zstd is not None else 1.0
+        s_keys = [k for k in sorted(self.proto_s) if self.count_s.get(k, 0) >= min_count]
+        t_keys = [k for k in sorted(self.proto_t) if self.count_t.get(k, 0) >= min_count]
+        if not s_keys or not t_keys:
+            self.assignment_map = {}
+            return {}
+
+        S = torch.stack([self.proto_s[k] for k in s_keys]) / (std if isinstance(std, float) else (std + 1e-8))
+        T = torch.stack([self.proto_t[k] for k in t_keys]) / (std if isinstance(std, float) else (std + 1e-8))
+        cost = torch.cdist(S, T)                                  # (ns, nt)
+        from scipy.optimize import linear_sum_assignment
+        r, c = linear_sum_assignment(cost.cpu().numpy())
+        pairs = {s_keys[i]: t_keys[j] for i, j in zip(r, c)}
+
+        if mutual_nn:
+            nn_t = {s_keys[i]: t_keys[int(cost[i].argmin())] for i in range(len(s_keys))}
+            nn_s = {t_keys[j]: s_keys[int(cost[:, j].argmin())] for j in range(len(t_keys))}
+            pairs = {k: v for k, v in pairs.items() if nn_t.get(k) == v and nn_s.get(v) == k}
+
+        self.assignment_map = pairs
+        return pairs
+
+    def align_loss(self, means_s, means_t, direction='s2t'):
+        std = (self.zstd + 1e-8) if self.zstd is not None else 1.0
+        terms = []
+        for sk, tk in self.assignment_map.items():
+            if direction in ('s2t', 'both') and sk in means_s and tk in self.proto_t:
+                terms.append((((means_s[sk] - self.proto_t[tk].detach()) / std) ** 2).sum())
+            if direction in ('t2s', 'both') and tk in means_t and sk in self.proto_s:
+                terms.append((((means_t[tk] - self.proto_s[sk].detach()) / std) ** 2).sum())
+        if not terms:
+            return None
+        return torch.stack(terms).mean()
+
+
+
+class DomainSpecificBN(nn.Module):
+    """Invelis peste un strat BatchNorm cu doua ramuri (source / target)."""
+
+    def __init__(self, bn):
+        super().__init__()
+        import copy
+        self.bn_s = copy.deepcopy(bn)   # mosteneste weight/bias/running stats incarcate
+        self.bn_t = copy.deepcopy(bn)
+        self.domain = 'target'          # implicit: target (folosit la eval)
+
+    def forward(self, x):
+        return self.bn_s(x) if self.domain == 'source' else self.bn_t(x)
+
+
+def convert_to_dsbn(module):
+    count = 0
+    for name, child in module.named_children():
+        if isinstance(child, nn.modules.batchnorm._BatchNorm):
+            setattr(module, name, DomainSpecificBN(child))
+            count += 1
+        else:
+            count += convert_to_dsbn(child)
+    return count
+
+
+def set_dsbn_domain(model, domain):
+    for m in model.modules():
+        if isinstance(m, DomainSpecificBN):
+            m.domain = domain
+
+
+def train_epoch_align(model, optimizer, criterion, pastis_loader, slovakia_loader,
+                      epoch, device, config):
+
+    acc_meter   = tnt.meter.ClassErrorMeter(accuracy=True)
+    loss_meter  = tnt.meter.AverageValueMeter()
+    cls_meter   = tnt.meter.AverageValueMeter()
+    align_meter = tnt.meter.AverageValueMeter()
+    y_true, y_pred = [], []
+    mmd_diag = None                      # diagnoza cu bandwidth fix, o data / epoca
+
+    align_type  = config['align_type']
+    lambda_a    = config['align_lambda']
+    cls_domains = config.get('align_cls_domains', 'both')
+    use_dsbn    = config.get('dsbn', False)
+
+    warmup = config.get('align_warmup_epochs', 0) or 0
+    lam_eff = lambda_a if warmup <= 0 else lambda_a * min(1.0, max(0, epoch - 1) / warmup)
+
+    if align_type == 'centroid' and not hasattr(model, '_centroid_mem'):
+        model._centroid_mem = CentroidMemory(ema=config.get('centroid_ema', 0.9))
+    mem = getattr(model, '_centroid_mem', None)
+
+    if align_type == 'centroid':
+        mem.compute_assignment(min_count=config.get('centroid_min_count', 50),
+                               mutual_nn=bool(config.get('centroid_mutual_nn', 1)))
+
+    print(f'  [Align] epoch={epoch}, type={align_type}, lambda_a={lambda_a:.3f} '
+          f'(eff={lam_eff:.3f}), cls_domains={cls_domains}, dsbn={use_dsbn}')
+
+    pastis_iter = iter(pastis_loader)
+
+    for i, (x_slovakia, y_slovakia) in enumerate(slovakia_loader):
+        try:
+            x_pastis, y_pastis = next(pastis_iter)
+        except StopIteration:
+            pastis_iter = iter(pastis_loader)
+            x_pastis, y_pastis = next(pastis_iter)
+
+        x_slovakia = recursive_todevice(x_slovakia, device)
+        x_pastis   = recursive_todevice(x_pastis,   device)
+        y_slovakia = y_slovakia.to(device)
+        y_pastis   = y_pastis.to(device)
+
+        if use_dsbn:
+            set_dsbn_domain(model, 'source')
+        if align_type == 'project' and config.get('project_freeze_source', 1):
+            # sursa din backbone INGHETAT (referinta preantrenata, fara gradient)
+            with torch.no_grad():
+                z_s = model._frozen_temporal(model._frozen_spatial(x_pastis))
+            out_s = None
+        else:
+            z_s, out_s = forward_with_embedding(model, x_pastis)
+        if use_dsbn:
+            set_dsbn_domain(model, 'target')
+        z_t, out_t = forward_with_embedding(model, x_slovakia)
+
+        if align_type == 'project':
+            loss_cls = criterion(out_t, y_slovakia.long())   # target = ancora
+        elif cls_domains == 'both':
+            loss_cls = criterion(out_s, y_pastis.long()) + criterion(out_t, y_slovakia.long())
+        elif cls_domains == 'target':
+            loss_cls = criterion(out_t, y_slovakia.long())
+        elif cls_domains == 'source':
+            loss_cls = criterion(out_s, y_pastis.long())
+        else:
+            raise ValueError(f'align_cls_domains necunoscut: {cls_domains}')
+
+        if align_type == 'mmd':
+            loss_align = mmd_loss(z_s, z_t,
+                                  kernel_mul=config['mmd_kernel_mul'],
+                                  kernel_num=config['mmd_kernel_num'])
+        elif align_type == 'coral':
+            loss_align = coral_loss(z_s, z_t)
+        elif align_type == 'centroid':
+            means_s, means_t = mem.observe(z_s, y_pastis, z_t, y_slovakia)
+            la = mem.align_loss(means_s, means_t,
+                                direction=config.get('centroid_direction', 's2t'))
+            loss_align = la if la is not None else z_t.sum() * 0.0
+        elif align_type == 'project':
+            z_s_proj = model._projector(z_s)
+            if config.get('project_align', 'mmd') == 'coral':
+                loss_align = coral_loss(z_s_proj, z_t)
+            else:
+                loss_align = mmd_loss(z_s_proj, z_t,
+                                      kernel_mul=config['mmd_kernel_mul'],
+                                      kernel_num=config['mmd_kernel_num'])
+        elif align_type is None:
+            loss_align = z_t.sum() * 0.0
+        else:
+            raise ValueError(f'align_type necunoscut: {align_type}')
+
+        loss = loss_cls + lam_eff * loss_align
+
+        if align_type == 'mmd' and i == 0:
+            mmd_diag = mmd_diagnostic(z_s, z_t)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        acc_meter.add(out_t.detach(), y_slovakia)
+        y_true.extend(list(map(int, y_slovakia)))
+        y_pred.extend(list(out_t.detach().argmax(dim=1).cpu().numpy()))
+        loss_meter.add(loss.item())
+        cls_meter.add(loss_cls.item())
+        align_meter.add(loss_align.item())
+
+        if (i + 1) % config['display_step'] == 0:
+            align_tag = align_type.upper() if align_type is not None else 'NOALIGN'
+            print('Step [{}/{}], Loss: {:.4f}, Cls: {:.4f}, {}: {:.4f}, Acc: {:.2f}'.format(
+                i + 1, len(slovakia_loader),
+                loss_meter.value()[0], cls_meter.value()[0],
+                align_tag, align_meter.value()[0], acc_meter.value()[0]))
+
+    align_contrib = lam_eff * align_meter.value()[0]
+
+    metrics = {
+        'train_loss':          loss_meter.value()[0],
+        'train_accuracy':      acc_meter.value()[0],
+        'train_IoU':           mIou(y_true, y_pred, n_classes=config['num_classes']),
+        'train_cls':           cls_meter.value()[0],
+        'train_align':         align_meter.value()[0],
+        'train_align_contrib': align_contrib,
+        'align_lambda_eff':    lam_eff,
+    }
+
+    if mmd_diag is not None:
+        metrics.update(mmd_diag)
+        print('  [MMD-diag] bw_median={:.4g}  mmd@0.1x={:.4g}  mmd@1x={:.4g}  mmd@10x={:.4g}  max={:.4g}'.format(
+            mmd_diag['mmd_bw_median'], mmd_diag['mmd_at_0p1x'],
+            mmd_diag['mmd_at_1x'], mmd_diag['mmd_at_10x'], mmd_diag['mmd_max']))
+
+    if align_type == 'centroid' and mem is not None:
+        n_pairs = len(mem.assignment_map)
+        metrics['centroid_n_pairs'] = n_pairs
+        amap = ', '.join(f'{s}->{t}' for s, t in sorted(mem.assignment_map.items())) or '(inca gol)'
+        print(f'  [Centroid] {n_pairs} perechi (min_count+mutualNN): {amap}')
+
+    return metrics
+# ---------------------------------------------------------------------------
 # Dataset builders
 # ---------------------------------------------------------------------------
 
 def build_single_dataset(folder, meanstd_filename, sub_classes, labels_column, config):
-    """
-    Instantiate a PixelSetData (or preloaded variant) for one dataset root.
-
-    Parameters
-    ----------
-    folder           : str   - root directory of the dataset
-    meanstd_filename : str   - filename of the mean/std pickle inside `folder`
-    sub_classes      : list  - integer class indices to keep
-    labels_column    : str   - name of the label column (e.g. 'CODE_GROUP')
-    config           : dict  - global config (for npixel, geomfeat, preload)
-
-    Remapping note
-    --------------
-    PASTIS   – PixelSetData remaps sub_classes [1,3,4,...,39] → 0..19 internally.
-    Slovakia – sub_classes [0,1,...,19] overlap with the actual CODE_GROUP values
-               (1,2,...,19) so no remapping occurs; labels stay as-is.
-               Classes absent from data (0,10,11,17) simply never appear in batches
-               and are excluded from the confusion matrix automatically.
-    """
     meanstd_path = os.path.join(folder, meanstd_filename)
     mean_std = pkl.load(open(meanstd_path, 'rb'))
     extra = 'geomfeat' if config['geomfeat'] else None
@@ -272,17 +559,7 @@ def build_single_dataset(folder, meanstd_filename, sub_classes, labels_column, c
 
 
 def build_datasets(config):
-    """
-    Build every requested dataset and return a list of
-        (dataset, name, is_slovakia)
-    tuples.  At least one of --dataset_pastis / --dataset_slovakia must be set.
 
-    Remapping policy
-    ----------------
-    PASTIS   → remap=True  : sub_classes [1,3,4,...,39] → 0..19  (done by PixelSetData)
-    Slovakia → remap=False : labels stay as they are in CODE_GROUP (1,2,...,19)
-                             num_classes=20 covers the highest label index (19).
-    """
     datasets = []
 
     if config['dataset_pastis']:
@@ -322,14 +599,7 @@ def build_datasets(config):
 # ---------------------------------------------------------------------------
 
 def stratified_split_train_val(dataset, seed):
-    """
-    Return (train_indices, val_indices, all_labels) for one dataset using a
-    deterministic stratified 85 / 15 train-val split.
 
-    The split is fully determined by `seed`, so passing the same seed for
-    Slovakia always yields the same val partition regardless of whether
-    PASTIS is also active.
-    """
     all_labels = [int(dataset[i][1]) for i in range(len(dataset))]
     indices = list(range(len(dataset)))
 
@@ -353,14 +623,6 @@ def _print_class_dist(split_name, indices, all_labels):
 # ---------------------------------------------------------------------------
 
 def get_loaders(datasets_with_names, config):
-    """
-    Build train / val DataLoaders.
-
-    Each dataset is split independently with a stratified 85/15 scheme.
-    Slovakia always uses config['rdm_seed'] so its val partition is identical
-    regardless of which other datasets are active.
-    Subsets are concatenated in deterministic order (PASTIS first, Slovakia second).
-    """
     train_subsets, val_subsets = [], []
 
     for ds, name, is_slovakia in datasets_with_names:
@@ -435,7 +697,10 @@ def get_loaders_mixup(datasets_with_names, config):
 
     pastis_loader   = None
     slovakia_loader = None
-    if config.get('mixup_type') is not None and pastis_train_subset and slovakia_train_subset:
+    needs_paired = (config.get('mixup_type') is not None
+                    or config.get('align_type') is not None
+                    or config.get('dsbn', False))
+    if needs_paired and pastis_train_subset and slovakia_train_subset:
         pastis_loader = data.DataLoader(
             pastis_train_subset, batch_size=config['batch_size'],
             shuffle=True, num_workers=config['num_workers'],
@@ -460,31 +725,7 @@ def get_loaders_mixup(datasets_with_names, config):
 # ---------------------------------------------------------------------------
 
 def load_checkpoint(model, optimizer, config):
-    """
-    Load weights from --resume_path into `model`.
-
-    Two modes controlled by --resume_mode:
-
-    'resume'   – Full restore: all weights + optimizer state + starting epoch.
-                 Use to continue an interrupted run on the exact same task.
-
-    'finetune' – Backbone-only restore: all weights EXCEPT decoder.6 (the
-                 final Linear projection to num_classes), which is re-initialised
-                 randomly.  Use when adapting to a new dataset / class count.
-                 Optimizer state is NOT restored (fresh Adam).
-
-    Model structure (verified from state_dict):
-        spatial_encoder.*            – PSE (mlp1, mlp2)
-        temporal_encoder.*           – TAE (position_enc, attention, mlp)
-        decoder.0 / decoder.1        – Linear(128→64) + BN
-        decoder.3 / decoder.4        – Linear(64→32)  + BN
-        decoder.6                    – Linear(32→num_classes)  <– dropped in finetune
-
-    Returns
-    -------
-    start_epoch : int
-    best_mIoU   : float
-    """
+    
     path = config['resume_path']
     mode = config['resume_mode']
 
@@ -507,7 +748,6 @@ def load_checkpoint(model, optimizer, config):
               f'(best_mIoU so far: {best_mIoU:.4f})')
 
     elif mode == 'finetune':
-        # Drop only the final classification layer so num_classes can differ
         DROPPED_PREFIXES = ('decoder.6.',)
 
         backbone_state = {
@@ -548,16 +788,7 @@ def load_checkpoint(model, optimizer, config):
 # ---------------------------------------------------------------------------
 
 def freeze_encoder(model, config):
-    """
-    Freeze spatial_encoder and/or temporal_encoder so only the decoder trains.
-    Call AFTER load_checkpoint so loaded weights are preserved.
 
-    Controlled by --freeze_encoder:
-        'all'      – freeze spatial_encoder + temporal_encoder
-        'spatial'  – freeze spatial_encoder only
-        'temporal' – freeze temporal_encoder only
-        False      – freeze nothing
-    """
     freeze_mode = config.get('freeze_encoder', False)
     if not freeze_mode:
         return
@@ -630,16 +861,7 @@ def plot_confusion_matrix(conf_mat, class_names, title='Confusion Matrix', norma
 
 
 def log_confusion_matrix(conf_mat, present_labels, config, epoch, mode='val'):
-    """
-    Save normalised + raw confusion matrix figures to disk and log to W&B.
 
-    Parameters
-    ----------
-    present_labels : list of int – class indices that actually appear in y_true.
-                     Used as axis tick labels so there are no empty rows/columns.
-                     For Slovakia these are the original CODE_GROUP values (1,2,...,19).
-                     For PASTIS these are remapped indices (0..19).
-    """
     class_names = [str(i) for i in present_labels]
 
     fig_norm = plot_confusion_matrix(
@@ -711,18 +933,7 @@ def train_epoch(model, optimizer, criterion, data_loader, device, config):
 
 
 def evaluation(model, criterion, loader, device, config, mode='val'):
-    """
-    Run inference on `loader`.
 
-    Returns
-    -------
-    metrics        : dict
-    conf_mat       : np.ndarray  – built only on classes present in y_true,
-                                   so no empty rows/columns for missing classes.
-    present_labels : list of int – the class indices used as confusion matrix axes.
-                                   For Slovakia: original CODE_GROUP values (1,2,...,19).
-                                   For PASTIS:   remapped indices (0..19).
-    """
     y_true, y_pred = [], []
     acc_meter = tnt.meter.ClassErrorMeter(accuracy=True)
     loss_meter = tnt.meter.AverageValueMeter()
@@ -742,14 +953,12 @@ def evaluation(model, criterion, loader, device, config, mode='val'):
         y_pred.extend(list(y_p))
 
     metrics = {
-        f'{mode}_accuracy': acc_meter.value()[0],
-        f'{mode}_loss':     loss_meter.value()[0],
-        f'{mode}_IoU':      mIou(y_true, y_pred, config['num_classes']),
-    }
+            f'{mode}_accuracy':          acc_meter.value()[0],
+            f'{mode}_balanced_accuracy': 100.0 * balanced_accuracy_score(y_true, y_pred),
+            f'{mode}_loss':              loss_meter.value()[0],
+            f'{mode}_IoU':               mIou(y_true, y_pred, config['num_classes']),
+        }
 
-    # Only include classes that actually appear in y_true so the confusion
-    # matrix has no empty rows/columns (relevant for Slovakia where labels
-    # are not remapped and some indices like 0,10,11,17 don't exist in data).
     present_labels = sorted(set(y_true))
     conf_mat = confusion_matrix(y_true, y_pred, labels=present_labels)
     return metrics, conf_mat, present_labels
@@ -799,8 +1008,9 @@ def main(config):
 
     wandb.init(
         entity='my_team_projects',
-        project='PASTIS',
+        project='MDPI_PASTIS',
         config=config,
+        tags=[t.strip() for t in config['wandb_tags'].split(',') if t.strip()],
         name=config['wandb_name'],
         resume='allow' if config['resume_mode'] == 'resume' else None,
     )
@@ -812,10 +1022,19 @@ def main(config):
     # ------------------------------------------------------------------
     datasets_with_names = build_datasets(config)
     first_ds = datasets_with_names[0][0]
-    # train_loader, val_loader = get_loaders(datasets_with_names, config)
     train_loader, val_loader, pastis_loader, slovakia_loader = get_loaders_mixup(datasets_with_names, config)
-    # validare că mixup e posibil
-    if config.get('mixup_type') is not None:
+
+    use_align_loop = (config.get('align_type') is not None or config.get('dsbn', False))
+    if use_align_loop:
+        if pastis_loader is None or slovakia_loader is None:
+            raise ValueError(
+                'Alinierea/DSBN necesită ambele dataset-uri active '
+                '(--dataset_pastis și --dataset_slovakia).')
+        print(f'\n[Align] Activ: type={config["align_type"]}, '
+              f'lambda_a={config["align_lambda"]}, '
+              f'cls_domains={config.get("align_cls_domains", "both")}, '
+              f'dsbn={config.get("dsbn", False)}')
+    elif config.get('mixup_type') is not None:
         if pastis_loader is None or slovakia_loader is None:
             raise ValueError(
                 'Mixup necesită ambele dataset-uri active (--dataset_pastis și --dataset_slovakia).')
@@ -854,14 +1073,34 @@ def main(config):
     criterion = FocalLoss(config['gamma'])
 
     # ------------------------------------------------------------------
-    # Checkpoint loading  (resume / finetune / scratch)
-    # ------------------------------------------------------------------
     start_epoch, best_mIoU = load_checkpoint(model, optimizer, config)
 
-    # ------------------------------------------------------------------
-    # Encoder freezing  (AFTER checkpoint so loaded weights are preserved)
-    # Rebuild optimizer with only trainable params when freezing.
-    # ------------------------------------------------------------------
+
+    if config.get('dsbn', False):
+        n_bn = convert_to_dsbn(model)
+        model = model.to(device)
+        print(f'[DSBN] {n_bn} straturi BatchNorm convertite in Domain-Specific BN.')
+        optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
+
+    if config.get('align_type') == 'project':
+        import copy
+        hidden = config.get('project_hidden', 0)
+        if hidden and hidden > 0:
+            model._projector = nn.Sequential(
+                nn.Linear(128, hidden), nn.ReLU(), nn.Linear(hidden, 128)).to(device)
+        else:
+            model._projector = nn.Linear(128, 128).to(device)   # varianta A: liniar
+        if config.get('project_freeze_source', 1):
+            model._frozen_spatial  = copy.deepcopy(model.spatial_encoder).to(device).eval()
+            model._frozen_temporal = copy.deepcopy(model.temporal_encoder).to(device).eval()
+            for p in list(model._frozen_spatial.parameters()) + list(model._frozen_temporal.parameters()):
+                p.requires_grad = False
+        print(f'[Project] proiector {"MLP" if hidden else "Linear"}(128->128) creat; '
+              f'frozen_source={bool(config.get("project_freeze_source", 1))}, '
+              f'align={config.get("project_align", "mmd")}')
+        optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=config['lr'])
+
+
     freeze_encoder(model, config)
     if config.get('freeze_encoder', False):
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -869,19 +1108,24 @@ def main(config):
 
     wandb.watch(model, criterion, log='all', log_freq=100)
 
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
+
     trainlog     = {}
     model_path   = os.path.join(config['res_dir'], 'model.pth.tar')
     best_conf_mat = None
     best_present_labels = None
-
+    best_acc     = 0.0          # <-- adaugă
+    best_bal_acc = 0.0          # <-- adaugă
     for epoch in range(start_epoch, config['epochs'] + 1):
         print('EPOCH {}/{}'.format(epoch, config['epochs']))
 
         model.train()
-        if config.get('mixup_type') is not None:
+        if config.get('align_type') is not None or config.get('dsbn', False):
+            train_metrics = train_epoch_align(
+                model, optimizer, criterion,
+                pastis_loader, slovakia_loader,
+                epoch=epoch, device=device, config=config,
+            )
+        elif config.get('mixup_type') is not None:
             train_metrics = train_epoch_mixup(
                 model, optimizer, criterion,
                 pastis_loader, slovakia_loader,
@@ -894,11 +1138,14 @@ def main(config):
             )
         print('Validation . . .')
         model.eval()
+        if config.get('dsbn', False):
+            set_dsbn_domain(model, 'target')   # evaluam pe target -> ramura target BN
         val_metrics, conf_mat, present_labels = evaluation(
             model, criterion, val_loader, device=device, config=config, mode='val')
 
-        print('Loss {:.4f},  Acc {:.2f},  IoU {:.4f}'.format(
-            val_metrics['val_loss'], val_metrics['val_accuracy'], val_metrics['val_IoU']))
+        print('Loss {:.4f},  Acc {:.2f},  BalAcc {:.2f},  IoU {:.4f}'.format(
+                    val_metrics['val_loss'], val_metrics['val_accuracy'],
+                    val_metrics['val_balanced_accuracy'], val_metrics['val_IoU']))
 
         trainlog[epoch] = {**train_metrics, **val_metrics}
         checkpoint(trainlog, config)
@@ -913,7 +1160,14 @@ def main(config):
             best_mIoU           = val_metrics['val_IoU']
             best_conf_mat       = conf_mat.copy()
             best_present_labels = present_labels[:]
+            # Running bests pe validare
+            best_acc     = max(best_acc,     val_metrics['val_accuracy'])
+            best_bal_acc = max(best_bal_acc, val_metrics['val_balanced_accuracy'])
+            # best_mIoU e actualizat în blocul de checkpoint de mai sus
 
+            wandb.run.summary['best_val_accuracy']          = best_acc
+            wandb.run.summary['best_val_balanced_accuracy'] = best_bal_acc
+            wandb.run.summary['best_val_IoU']               = best_mIoU
             torch.save({
                 'epoch':      epoch,
                 'best_mIoU':  best_mIoU,
@@ -934,11 +1188,12 @@ def main(config):
     print('Saving results for best checkpoint (val_IoU={:.4f}) . . .'.format(best_mIoU))
     model.load_state_dict(torch.load(model_path)['state_dict'])
     model.eval()
+    if config.get('dsbn', False):
+        set_dsbn_domain(model, 'target')
     best_val_metrics, best_conf_mat, best_present_labels = evaluation(
         model, criterion, val_loader, device=device, config=config, mode='val')
     save_results(best_val_metrics, best_conf_mat, config)
 
-    # Best confusion matrix → dedicated W&B image
     class_names = [str(i) for i in best_present_labels]
     fig_best = plot_confusion_matrix(
         best_conf_mat, class_names,
@@ -988,6 +1243,8 @@ if __name__ == '__main__':
     YEAR = 2020
     parser.add_argument('--wandb_name', default=f'{YEAR}_128_mixup_temporal_20epochs', type=str,
                         help='Name of the W&B run. Results saved under <res_dir>/<wandb_name>/.')
+    parser.add_argument('--wandb_tags', default='task_1', type=str,
+                        help='Comma-separated W&B tags for the run (e.g. "task_1" or "task_2").')
 
     # -----------------------------------------------------------------------
     # Resume / fine-tune
@@ -998,8 +1255,60 @@ if __name__ == '__main__':
     parser.add_argument('--mixup_warmup_epochs', default=50, type=int,  
                         help='Numărul de epoci în care lam scade de la 1.0 (pur PASTIS) '
                              'la 0.0 (pur Slovakia). După warmup antrenează doar pe Slovakia.')
-    
-    parser.add_argument('--resume_path', default='', type=str,#/home/mnegru/Adelina/PASTIS/results/baseline_128/model.pth.tar
+
+
+    parser.add_argument('--align_type', default=None, type=str,
+                        choices=['mmd', 'coral', 'centroid', 'project'],
+                        help='Metodă de aliniere în spațiul de feature pe embedding-ul '
+                             'global z (128-d). Dacă e setată (sau --dsbn), are prioritate '
+                             'față de mixup: L = L_FL + lambda_a * L_align. '
+                             'centroid = pseudo-corespondenta prin asignare Hungarian '
+                             '(nu presupune corespondenta de indici de clasa). '
+                             'Lăsat gol => fără termen de aliniere (folosit cu --dsbn).')
+    parser.add_argument('--align_lambda', default=1.0, type=float,
+                        help='Ponderea lambda_a a termenului de aliniere (mmd/coral/centroid).')
+    parser.add_argument('--align_cls_domains', default='target', type=str,
+                        choices=['both', 'target', 'source'],
+                        help='Pe ce domenii se calculează pierderea de clasificare în '
+                             'timpul alinierii (target = Slovacia, etichetat din LPIS).')
+    parser.add_argument('--centroid_ema', default=0.9, type=float,
+                        help='Coeficient EMA pentru prototipurile per clasa (align_type=centroid).')
+    parser.add_argument('--align_warmup_epochs', default=0, type=int,
+                        help='Warmup pentru lambda de aliniere: 0->lambda_a liniar pe primele '
+                             'N epoci (0 = fara warmup). Recomandat ~10 pentru centroid, ca '
+                             'embedding-ul sa se formeze inainte sa alinieze.')
+    parser.add_argument('--centroid_min_count', default=50, type=int,
+                        help='Nr. minim de exemple acumulate ca o clasa sa intre in asignare '
+                             '(exclude clasele rare cu prototip zgomotos).')
+    parser.add_argument('--centroid_mutual_nn', default=1, type=int,
+                        help='1 = pastreaza doar perechile mutual-cel-mai-apropiat in asignare '
+                             '(stabilizeaza matching-ul). 0 = toate perechile Hungarian.')
+    parser.add_argument('--centroid_direction', default='s2t', type=str,
+                        choices=['s2t', 't2s', 'both'],
+                        help='Directia alinierii de centroizi. s2t (recomandat) misca doar '
+                             'sursa spre target, lasand target-ul ancorat de clasificare; '
+                             'both = simetric (poate corupe target-ul la matching gresit).')
+    parser.add_argument('--project_freeze_source', default=1, type=int,
+                        help='align_type=project: 1 = backbone sursa inghetat (copie a '
+                             'ponderilor preantrenate, referinta fixa); 0 = sursa din '
+                             'backbone-ul partajat antrenabil.')
+    parser.add_argument('--project_align', default='mmd', type=str, choices=['mmd', 'coral'],
+                        help='align_type=project: cum se aliniaza T(z_s) la z_t (mmd standardizat '
+                             'sau coral).')
+    parser.add_argument('--project_hidden', default=0, type=int,
+                        help='align_type=project: 0 = proiector Linear(128,128) (varianta A); '
+                             '>0 = MLP cu acest strat ascuns (varianta B).')
+    parser.add_argument('--dsbn', action='store_true',
+                        help='Domain-Specific BatchNorm: statistici + affine BN separate '
+                             'per domeniu (sursa/target). Se poate combina cu orice --align_type '
+                             'sau folosi singur (fara --align_type) pentru DSBN pur. Absoarbe '
+                             'shiftul de medie per-domeniu fara hiperparametru.')
+    parser.add_argument('--mmd_kernel_num', default=5, type=int,
+                        help='Numărul de kernel-uri RBF în amestecul MMD.')
+    parser.add_argument('--mmd_kernel_mul', default=2.0, type=float,
+                        help='Multiplicatorul de bandwidth între kernel-urile RBF succesive.')
+
+    parser.add_argument('--resume_path', default='', type=str,
                         help='Path to a checkpoint (.pth.tar). Leave empty for scratch.')
     parser.add_argument('--resume_mode', default='finetune', type=str,
                         choices=['resume', 'finetune'],
@@ -1014,15 +1323,13 @@ if __name__ == '__main__':
                         'Choices: all | spatial | temporal | False (default: False).'
                     ))
 
-    # -----------------------------------------------------------------------
-    # Dataset paths
-    # -----------------------------------------------------------------------
+
     parser.add_argument('--dataset_pastis',
-                        default='/home/mnegru/Adelina/Final_data/S2-2017-T31TFM-PixelSet',
+                        default='',
                         type=str,
                         help='Root folder of the PASTIS dataset. Set to "" to disable.')
     parser.add_argument('--dataset_slovakia',
-                        default=f'/home/mnegru/Adelina/Final_data/PixelSet-Slovakia-{YEAR}',
+                        default=f'',
                         type=str,
                         help='Root folder of the Slovakia dataset. Set to "" to disable.')
 
@@ -1045,8 +1352,6 @@ if __name__ == '__main__':
     parser.add_argument('--slovakia_labels', default='CODE_GROUP', type=str,
                         help='Label column name for Slovakia.')
     parser.add_argument('--slovakia_subclasses',
-                        
-                        # default='[1,3,4,5,6,8,9,12,13,14,16,18,19,23,28,31,33,34,36,39]',
                         default='[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]',
                         type=str,
                         help=(
